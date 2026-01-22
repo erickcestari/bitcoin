@@ -99,6 +99,10 @@ static const size_t DEFAULT_MAXRECEIVEBUFFER = 5 * 1000;
 static const size_t DEFAULT_MAXSENDBUFFER    = 1 * 1000;
 
 static constexpr bool DEFAULT_V2_TRANSPORT{true};
+/** Default for enabling BIP324 decoy packets */
+static constexpr bool DEFAULT_V2_DECOYS{false};
+/** Default maximum decoy content size in bytes */
+static constexpr unsigned int DEFAULT_V2_DECOY_MAX_SIZE{256};
 
 typedef int64_t NodeId;
 
@@ -664,6 +668,10 @@ public:
     // Miscellaneous functions.
     bool ShouldReconnectV1() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex, !m_send_mutex);
     Info GetInfo() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
+
+    /** Queue a decoy packet with random content of specified length.
+     *  Returns true if queued, false if not in READY state or buffer not empty. */
+    bool SendDecoyPacket(size_t content_length) noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
 };
 
 struct CNodeOptions
@@ -1099,6 +1107,8 @@ public:
         bool whitelist_forcerelay = DEFAULT_WHITELISTFORCERELAY;
         bool whitelist_relay = DEFAULT_WHITELISTRELAY;
         bool m_capture_messages = false;
+        bool m_v2_decoys_enabled = DEFAULT_V2_DECOYS;
+        unsigned int m_v2_decoy_max_size = DEFAULT_V2_DECOY_MAX_SIZE;
     };
 
     void Init(const Options& connOptions) EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex, !m_total_bytes_sent_mutex)
@@ -1137,6 +1147,8 @@ public:
         whitelist_forcerelay = connOptions.whitelist_forcerelay;
         whitelist_relay = connOptions.whitelist_relay;
         m_capture_messages = connOptions.m_capture_messages;
+        m_v2_decoys_enabled = connOptions.m_v2_decoys_enabled;
+        m_v2_decoy_max_size = connOptions.m_v2_decoy_max_size;
     }
 
     // test only
@@ -1753,6 +1765,16 @@ private:
      * flag for whether messages are captured
      */
     bool m_capture_messages{false};
+
+    /**
+     * Whether BIP324 decoy packet sending is enabled.
+     */
+    bool m_v2_decoys_enabled{DEFAULT_V2_DECOYS};
+
+    /**
+     * Maximum content size for decoy packets in bytes.
+     */
+    unsigned int m_v2_decoy_max_size{DEFAULT_V2_DECOY_MAX_SIZE};
 
     /**
      * Mutex protecting m_i2p_sam_sessions.

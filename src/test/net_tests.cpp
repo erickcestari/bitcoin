@@ -1332,6 +1332,36 @@ public:
     {
         m_to_send[m_rng.randrange(m_to_send.size())] ^= (uint8_t{1} << m_rng.randrange(8));
     }
+
+    /** Expose the transport for testing SendDecoyPacket. */
+    V2Transport& GetTransport() { return m_transport; }
+
+    /** Expect a decoy packet to have been received (only after ReceiveKey).
+     *  Returns the content length of the decoy. */
+    size_t ReceiveDecoyPacket()
+    {
+        // When processing a packet, at least enough bytes for its length descriptor must be received.
+        BOOST_REQUIRE(m_received.size() >= BIP324Cipher::LENGTH_LEN);
+        // Decrypt the content length.
+        size_t size = m_cipher.DecryptLength(MakeByteSpan(std::span{m_received}.first(BIP324Cipher::LENGTH_LEN)));
+        // Check that the full packet is in the receive buffer.
+        BOOST_REQUIRE(m_received.size() >= size + BIP324Cipher::EXPANSION);
+        // Decrypt the packet contents.
+        std::vector<uint8_t> contents(size);
+        bool ignore{false};
+        bool ret = m_cipher.Decrypt(
+            /*input=*/MakeByteSpan(
+                std::span{m_received}.first(size + BIP324Cipher::EXPANSION).subspan(BIP324Cipher::LENGTH_LEN)),
+            /*aad=*/{},
+            /*ignore=*/ignore,
+            /*contents=*/MakeWritableByteSpan(contents));
+        BOOST_CHECK(ret);
+        // Verify the ignore bit is set (this is a decoy).
+        BOOST_CHECK(ignore);
+        // Strip the processed packet's bytes off the front of the receive buffer.
+        m_received.erase(m_received.begin(), m_received.begin() + size + BIP324Cipher::EXPANSION);
+        return size;
+    }
 };
 
 } // namespace
@@ -1552,6 +1582,64 @@ BOOST_AUTO_TEST_CASE(v2transport_test)
         tester.SendV1Version(CChainParams::Main()->MessageStart());
         auto ret = tester.Interact();
         BOOST_CHECK(!ret);
+    }
+
+    // Test SendDecoyPacket functionality
+    {
+        for (int i = 0; i < 10; ++i) {
+            V2TransportTester tester(m_rng, true);
+            
+            // Before handshake completes, SendDecoyPacket should fail
+            BOOST_CHECK(!tester.GetTransport().SendDecoyPacket(32));
+            
+            // Complete the handshake
+            auto ret = tester.Interact();
+            BOOST_REQUIRE(ret && ret->empty());
+            tester.SendKey();
+            tester.SendGarbage();
+            tester.ReceiveKey();
+            tester.SendGarbageTerm();
+            ret = tester.Interact();
+            BOOST_REQUIRE(ret && ret->empty());
+            tester.ReceiveGarbage();
+            tester.SendVersion();
+            ret = tester.Interact();
+            BOOST_REQUIRE(ret && ret->empty());
+            tester.ReceiveVersion();
+            tester.CompareSessionIDs();
+            
+            // Now the transport should be in READY state
+            // Test SendDecoyPacket with various sizes
+            for (size_t decoy_size : {1, 32, 128, 256}) {
+                // Send a decoy packet
+                BOOST_CHECK(tester.GetTransport().SendDecoyPacket(decoy_size));
+                
+                // SendDecoyPacket should fail while buffer is not empty
+                BOOST_CHECK(!tester.GetTransport().SendDecoyPacket(32));
+                
+                // Interact to send the decoy
+                ret = tester.Interact();
+                BOOST_REQUIRE(ret && ret->empty());
+                
+                // Verify we received a decoy packet with the correct size
+                size_t received_size = tester.ReceiveDecoyPacket();
+                BOOST_CHECK_EQUAL(received_size, decoy_size);
+            }
+            
+            // After sending a real message, SendDecoyPacket should work
+            std::vector<uint8_t> ping_payload{1, 2, 3, 4, 5, 6, 7, 8};
+            tester.AddMessage("ping", ping_payload);
+            ret = tester.Interact();
+            BOOST_REQUIRE(ret && ret->empty());
+            tester.ReceiveMessage(uint8_t(18), ping_payload);
+            
+            // Now we can send another decoy
+            BOOST_CHECK(tester.GetTransport().SendDecoyPacket(64));
+            ret = tester.Interact();
+            BOOST_REQUIRE(ret && ret->empty());
+            size_t received_size = tester.ReceiveDecoyPacket();
+            BOOST_CHECK_EQUAL(received_size, 64);
+        }
     }
 }
 

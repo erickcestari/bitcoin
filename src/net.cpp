@@ -1521,6 +1521,23 @@ bool V2Transport::SetMessageToSend(CSerializedNetMsg& msg) noexcept
     return true;
 }
 
+bool V2Transport::SendDecoyPacket(size_t content_length) noexcept
+{
+    AssertLockNotHeld(m_send_mutex);
+    LOCK(m_send_mutex);
+    if (m_send_state == SendState::V1) return false;
+    if (!(m_send_state == SendState::READY && m_send_buffer.empty())) return false;
+
+    FastRandomContext rng;
+    std::vector<uint8_t> contents(content_length);
+    rng.fillrand(MakeWritableByteSpan(contents));
+
+    m_send_buffer.resize(contents.size() + BIP324Cipher::EXPANSION);
+    m_cipher.Encrypt(MakeByteSpan(contents), {}, /*ignore=*/true, MakeWritableByteSpan(m_send_buffer));
+    m_send_type.clear();
+    return true;
+}
+
 Transport::BytesToSend V2Transport::GetBytesToSend(bool have_next_message) const noexcept
 {
     AssertLockNotHeld(m_send_mutex);
@@ -1613,6 +1630,7 @@ std::pair<size_t, bool> CConnman::SocketSendData(CNode& node) const
     size_t nSentSize = 0;
     bool data_left{false}; //!< second return value (whether unsent data remains)
     std::optional<bool> expected_more;
+    bool decoy_sent{false}; //!< track if we've already sent a decoy this call
 
     while (true) {
         if (it != node.vSendMsg.end()) {
@@ -1633,6 +1651,23 @@ std::pair<size_t, bool> CConnman::SocketSendData(CNode& node) const
         if (expected_more.has_value()) Assume(!data.empty() == *expected_more);
         expected_more = more;
         data_left = !data.empty(); // will be overwritten on next loop if all of data gets sent
+
+        // Consider sending a decoy when buffer is empty and no more messages queued
+        if (m_v2_decoys_enabled && !decoy_sent && data.empty() && !more) {
+            auto* v2transport = dynamic_cast<V2Transport*>(node.m_transport.get());
+            if (v2transport) {
+                FastRandomContext rng;
+                if (rng.randrange(100) < 10) {
+                    size_t decoy_size = 1 + rng.randrange(m_v2_decoy_max_size);
+                    if (v2transport->SendDecoyPacket(decoy_size)) {
+                        decoy_sent = true;
+                        expected_more.reset();
+                        continue; // Loop back to send the decoy
+                    }
+                }
+            }
+        }
+
         int nBytes = 0;
         if (!data.empty()) {
             LOCK(node.m_sock_mutex);
