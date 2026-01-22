@@ -53,6 +53,7 @@ class BanMan;
 class CChainParams;
 class CNode;
 class CScheduler;
+class V2Transport;
 struct bilingual_str;
 
 /** Time after which to disconnect, after waiting for a ping response (or inactivity). */
@@ -99,6 +100,24 @@ static const size_t DEFAULT_MAXRECEIVEBUFFER = 5 * 1000;
 static const size_t DEFAULT_MAXSENDBUFFER    = 1 * 1000;
 
 static constexpr bool DEFAULT_V2_TRANSPORT{true};
+/** Default for enabling BIP324 decoy packets */
+static constexpr bool DEFAULT_V2_DECOYS{false};
+/** Default maximum decoy content size in bytes */
+static constexpr unsigned int DEFAULT_V2_DECOY_MAX_SIZE{256};
+/** Minimum valid decoy max size in bytes */
+static constexpr unsigned int MIN_V2_DECOY_MAX_SIZE{1};
+/** Maximum valid decoy max size in bytes (to prevent excessive memory/bandwidth usage) */
+static constexpr unsigned int MAX_V2_DECOY_MAX_SIZE{4096};
+/** Default interval for checking whether to send decoys (in milliseconds) */
+static constexpr std::chrono::milliseconds DEFAULT_V2_DECOY_INTERVAL{100};
+/** Minimum valid decoy interval in milliseconds */
+static constexpr std::chrono::milliseconds MIN_V2_DECOY_INTERVAL{10};
+/** Maximum valid decoy interval in milliseconds */
+static constexpr std::chrono::milliseconds MAX_V2_DECOY_INTERVAL{60000};
+/** Default probability per interval per peer for sending a decoy (in per mille, i.e. 50 = 5%) */
+static constexpr unsigned int DEFAULT_V2_DECOY_RATE_PERMILLE{50};
+/** Maximum valid decoy rate per mille (1000 = 100%, i.e., always send) */
+static constexpr unsigned int MAX_V2_DECOY_RATE_PERMILLE{1000};
 
 typedef int64_t NodeId;
 
@@ -270,6 +289,9 @@ public:
 
     /** Retrieve information about this transport. */
     virtual Info GetInfo() const noexcept = 0;
+
+    /** Return non-null if this transport is V2 */
+    virtual V2Transport* AsV2() noexcept { return nullptr; }
 
     // 1. Receiver side functions, for decoding bytes received on the wire into transport protocol
     // agnostic CNetMessage (message type & payload) objects.
@@ -640,6 +662,8 @@ private:
 public:
     static constexpr uint32_t MAX_GARBAGE_LEN = 4095;
 
+    V2Transport* AsV2() noexcept override { return this; }
+
     /** Construct a V2 transport with securely generated random keys.
      *
      * @param[in] nodeid      the node's NodeId (only for debug log output).
@@ -664,6 +688,12 @@ public:
     // Miscellaneous functions.
     bool ShouldReconnectV1() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex, !m_send_mutex);
     Info GetInfo() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
+
+    /** Queue a decoy packet with random content of specified length.
+     *  @param[in] content_length The length of random content for the decoy packet.
+     *  @param[in,out] rng Random number generator to use for filling the packet contents.
+     *  @return true if queued, false if not in READY state or buffer not empty. */
+    bool SendDecoyPacket(size_t content_length, FastRandomContext& rng) noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
 };
 
 struct CNodeOptions
@@ -1099,6 +1129,10 @@ public:
         bool whitelist_forcerelay = DEFAULT_WHITELISTFORCERELAY;
         bool whitelist_relay = DEFAULT_WHITELISTRELAY;
         bool m_capture_messages = false;
+        bool m_v2_decoys_enabled = DEFAULT_V2_DECOYS;
+        unsigned int m_v2_decoy_max_size = DEFAULT_V2_DECOY_MAX_SIZE;
+        std::chrono::milliseconds m_v2_decoy_interval = DEFAULT_V2_DECOY_INTERVAL;
+        unsigned int m_v2_decoy_rate_permille = DEFAULT_V2_DECOY_RATE_PERMILLE;
     };
 
     void Init(const Options& connOptions) EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex, !m_total_bytes_sent_mutex)
@@ -1137,6 +1171,10 @@ public:
         whitelist_forcerelay = connOptions.whitelist_forcerelay;
         whitelist_relay = connOptions.whitelist_relay;
         m_capture_messages = connOptions.m_capture_messages;
+        m_v2_decoys_enabled = connOptions.m_v2_decoys_enabled;
+        m_v2_decoy_max_size = connOptions.m_v2_decoy_max_size;
+        m_v2_decoy_interval = connOptions.m_v2_decoy_interval;
+        m_v2_decoy_rate_permille = connOptions.m_v2_decoy_rate_permille;
     }
 
     // test only
@@ -1255,6 +1293,8 @@ public:
 
     bool CheckIncomingNonce(uint64_t nonce);
     void ASMapHealthCheck();
+    /** Periodically called to maybe send decoy packets to V2 peers for traffic analysis resistance. */
+    void MaybeSendDecoys() EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex, !m_total_bytes_sent_mutex);
 
     // alias for thread safety annotations only, not defined
     RecursiveMutex& GetNodesMutex() const LOCK_RETURNED(m_nodes_mutex);
@@ -1753,6 +1793,26 @@ private:
      * flag for whether messages are captured
      */
     bool m_capture_messages{false};
+
+    /**
+     * Whether BIP324 decoy packet sending is enabled.
+     */
+    bool m_v2_decoys_enabled{DEFAULT_V2_DECOYS};
+
+    /**
+     * Maximum content size for decoy packets in bytes.
+     */
+    unsigned int m_v2_decoy_max_size{DEFAULT_V2_DECOY_MAX_SIZE};
+
+    /**
+     * Interval for checking whether to send decoys.
+     */
+    std::chrono::milliseconds m_v2_decoy_interval{DEFAULT_V2_DECOY_INTERVAL};
+
+    /**
+     * Probability per interval per peer for sending a decoy (in per mille).
+     */
+    unsigned int m_v2_decoy_rate_permille{DEFAULT_V2_DECOY_RATE_PERMILLE};
 
     /**
      * Mutex protecting m_i2p_sam_sessions.

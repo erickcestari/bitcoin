@@ -7,6 +7,7 @@
 
 #include <net.h>
 
+#include "node/connection_types.h"
 #include <addrdb.h>
 #include <addrman.h>
 #include <banman.h>
@@ -1518,6 +1519,28 @@ bool V2Transport::SetMessageToSend(CSerializedNetMsg& msg) noexcept
     m_send_type = msg.m_type;
     // Release memory
     ClearShrink(msg.data);
+    return true;
+}
+
+bool V2Transport::SendDecoyPacket(size_t content_length, FastRandomContext& rng) noexcept
+{
+    AssertLockNotHeld(m_send_mutex);
+    LOCK(m_send_mutex);
+    if (m_send_state == SendState::V1) return false;
+    if (!(m_send_state == SendState::READY && m_send_buffer.empty())) return false;
+
+    m_send_buffer.resize(content_length + BIP324Cipher::EXPANSION);
+
+    // Use a thread-local static buffer to avoid repeated allocations in the hot path.
+    // This is safe because SendDecoyPacket is only called from the scheduler thread.
+    thread_local std::vector<uint8_t> contents;
+    contents.resize(content_length);
+    rng.fillrand(MakeWritableByteSpan(contents));
+
+    m_cipher.Encrypt(MakeByteSpan(contents), {}, /*ignore=*/true, MakeWritableByteSpan(m_send_buffer));
+    m_send_type.clear();
+
+    LogDebug(BCLog::NET, "Queued decoy packet (%zu bytes) for peer=%d\n", content_length, m_nodeid);
     return true;
 }
 
@@ -3578,6 +3601,11 @@ bool CConnman::Start(CScheduler& scheduler, const Options& connOptions)
         scheduler.scheduleEvery([this] { ASMapHealthCheck(); }, ASMAP_HEALTH_CHECK_INTERVAL);
     }
 
+    // Schedule decoy packet sending for traffic analysis resistance
+    if (m_v2_decoys_enabled) {
+        scheduler.scheduleEvery([this] { MaybeSendDecoys(); }, m_v2_decoy_interval);
+    }
+
     return true;
 }
 
@@ -4191,6 +4219,40 @@ void CConnman::ASMapHealthCheck()
     std::transform(v6_addrs.begin(), v6_addrs.end(), std::back_inserter(clearnet_addrs),
         [](const CAddress& addr) { return static_cast<CNetAddr>(addr); });
     m_netgroupman.ASMapHealthCheck(clearnet_addrs);
+}
+
+void CConnman::MaybeSendDecoys()
+{
+    AssertLockNotHeld(m_nodes_mutex);
+    AssertLockNotHeld(m_total_bytes_sent_mutex);
+
+    if (!m_v2_decoys_enabled) return;
+
+    FastRandomContext rng;
+
+    const NodesSnapshot snap{*this, /*shuffle=*/true};
+
+    for (CNode* pnode : snap.Nodes()) {
+        if (pnode->fDisconnect) continue;
+
+        auto* v2transport = pnode->m_transport->AsV2();
+        if (!v2transport) continue;
+
+        // Random chance per node per interval
+        if (rng.randrange(MAX_V2_DECOY_RATE_PERMILLE) < m_v2_decoy_rate_permille) {
+            size_t nBytesSent = 0;
+            {
+                LOCK(pnode->cs_vSend);
+                // Generate random decoy size between 1 and m_v2_decoy_max_size (inclusive)
+                size_t decoy_size = 1 + rng.randrange(m_v2_decoy_max_size);
+                if (v2transport->SendDecoyPacket(decoy_size, rng)) {
+                    // Try to send the decoy immediately (optimistic write)
+                    std::tie(nBytesSent, std::ignore) = SocketSendData(*pnode);
+                }
+            }
+            if (nBytesSent) RecordBytesSent(nBytesSent);
+        }
+    }
 }
 
 // Dump binary message to file, with timestamp.

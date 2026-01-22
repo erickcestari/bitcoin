@@ -555,6 +555,10 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-i2pacceptincoming", strprintf("Whether to accept inbound I2P connections (default: %i). Ignored if -i2psam is not set. Listening for inbound I2P connections is done through the SAM proxy, not by binding to a local address and port.", DEFAULT_I2P_ACCEPT_INCOMING), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-onlynet=<net>", "Make automatic outbound connections only to network <net> (" + Join(GetNetworkNames(), ", ") + "). Inbound and manual connections are not affected by this option. It can be specified multiple times to allow multiple networks.", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-v2transport", strprintf("Support v2 transport (default: %u)", DEFAULT_V2_TRANSPORT), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-v2decoys", strprintf("Enable BIP324 decoy packet sending for v2 connections for traffic analysis resistance (default: %u)", DEFAULT_V2_DECOYS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-v2decoymaxsize=<n>", strprintf("Maximum content size for decoy packets in bytes, range %u-%u (default: %u)", MIN_V2_DECOY_MAX_SIZE, MAX_V2_DECOY_MAX_SIZE, DEFAULT_V2_DECOY_MAX_SIZE), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-v2decoyinterval=<ms>", strprintf("Interval in milliseconds for checking whether to send decoys, range %d-%d (default: %d)", MIN_V2_DECOY_INTERVAL.count(), MAX_V2_DECOY_INTERVAL.count(), DEFAULT_V2_DECOY_INTERVAL.count()), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-v2decoyrate=<permille>", strprintf("Probability per interval per peer for sending a decoy in per mille, range 0-%u (default: %u, i.e. %.1f%%)", MAX_V2_DECOY_RATE_PERMILLE, DEFAULT_V2_DECOY_RATE_PERMILLE, DEFAULT_V2_DECOY_RATE_PERMILLE / 10.0), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-peerbloomfilters", strprintf("Support filtering of blocks and transaction with bloom filters (default: %u)", DEFAULT_PEERBLOOMFILTERS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-peerblockfilters", strprintf("Serve compact block filters to peers per BIP 157 (default: %u)", DEFAULT_PEERBLOCKFILTERS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-txreconciliation", strprintf("Enable transaction reconciliations per BIP 330 (default: %d)", DEFAULT_TXRECONCILIATION_ENABLE), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CONNECTION);
@@ -1051,6 +1055,29 @@ bool AppInitParameterInteraction(const ArgsManager& args)
     peer_connect_timeout = args.GetIntArg("-peertimeout", DEFAULT_PEER_CONNECT_TIMEOUT);
     if (peer_connect_timeout <= 0) {
         return InitError(Untranslated("peertimeout must be a positive integer."));
+    }
+
+    // Validate BIP324 decoy packet configuration
+    if (args.GetBoolArg("-v2decoys", DEFAULT_V2_DECOYS)) {
+        const auto v2_decoy_max_size = args.GetIntArg("-v2decoymaxsize", DEFAULT_V2_DECOY_MAX_SIZE);
+        if (v2_decoy_max_size < static_cast<int64_t>(MIN_V2_DECOY_MAX_SIZE) ||
+            v2_decoy_max_size > static_cast<int64_t>(MAX_V2_DECOY_MAX_SIZE)) {
+            return InitError(strprintf(_("-v2decoymaxsize must be between %u and %u bytes"),
+                                       MIN_V2_DECOY_MAX_SIZE, MAX_V2_DECOY_MAX_SIZE));
+        }
+
+        const auto v2_decoy_interval = args.GetIntArg("-v2decoyinterval", DEFAULT_V2_DECOY_INTERVAL.count());
+        if (v2_decoy_interval < MIN_V2_DECOY_INTERVAL.count() ||
+            v2_decoy_interval > MAX_V2_DECOY_INTERVAL.count()) {
+            return InitError(strprintf(_("-v2decoyinterval must be between %d and %d milliseconds"),
+                                       MIN_V2_DECOY_INTERVAL.count(), MAX_V2_DECOY_INTERVAL.count()));
+        }
+
+        const auto v2_decoy_rate = args.GetIntArg("-v2decoyrate", DEFAULT_V2_DECOY_RATE_PERMILLE);
+        if (v2_decoy_rate < 0 || v2_decoy_rate > static_cast<int64_t>(MAX_V2_DECOY_RATE_PERMILLE)) {
+            return InitError(strprintf(_("-v2decoyrate must be between 0 and %u (per mille)"),
+                                       MAX_V2_DECOY_RATE_PERMILLE));
+        }
     }
 
     if (const auto arg{args.GetArg("-blockmintxfee")}) {
@@ -2060,6 +2087,10 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     connOptions.whitelist_forcerelay = args.GetBoolArg("-whitelistforcerelay", DEFAULT_WHITELISTFORCERELAY);
     connOptions.whitelist_relay = args.GetBoolArg("-whitelistrelay", DEFAULT_WHITELISTRELAY);
     connOptions.m_capture_messages = args.GetBoolArg("-capturemessages", false);
+    connOptions.m_v2_decoys_enabled = args.GetBoolArg("-v2decoys", DEFAULT_V2_DECOYS);
+    connOptions.m_v2_decoy_max_size = args.GetIntArg("-v2decoymaxsize", DEFAULT_V2_DECOY_MAX_SIZE);
+    connOptions.m_v2_decoy_interval = std::chrono::milliseconds{args.GetIntArg("-v2decoyinterval", DEFAULT_V2_DECOY_INTERVAL.count())};
+    connOptions.m_v2_decoy_rate_permille = args.GetIntArg("-v2decoyrate", DEFAULT_V2_DECOY_RATE_PERMILLE);
 
     // Port to bind to if `-bind=addr` is provided without a `:port` suffix.
     const uint16_t default_bind_port =
